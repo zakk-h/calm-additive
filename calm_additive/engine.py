@@ -524,7 +524,11 @@ class ExecutableCALM:
         surrogate: Optional[SurrogateModel] = None,
         transform: Optional[MaskedTransform] = None,
         curve_fitter: Optional[MaskedFitter] = None,
+        base_logit_fn: Optional[Callable] = None,
+        requires_init_score: bool = False,
     ):
+        self.base_logit_fn = base_logit_fn
+        self.requires_init_score = requires_init_score
         self.task = task
         self.partitions = partitions
         self.chain = chain
@@ -533,15 +537,25 @@ class ExecutableCALM:
         self.transform = transform
         self.curve_fitter = curve_fitter
 
-    def predict_score(self, X) -> np.ndarray:
+    def predict_score(self, X, init_score=None) -> np.ndarray:
         X = np.asarray(X, dtype=float)
+        if self.requires_init_score:
+            if init_score is None and self.base_logit_fn is None:
+                raise ValueError('init_score is required for prediction when fit used array offsets')
+            if init_score is None:
+                init_score = self.base_logit_fn(X)
+            init_score = _check_init_score(init_score, len(X))
+        elif init_score is not None:
+            raise ValueError('fit must use init_score before prediction can accept it')
         if self.surrogate is not None:
             return self.surrogate.predict(X)
         Xt, mask = self.transform.transform(X)
+        if self.requires_init_score:
+            return np.asarray(self.curve_fitter.predict(Xt, mask, init_score=init_score)).reshape(-1)
         return np.asarray(self.curve_fitter.predict(Xt, mask)).reshape(-1)
 
-    def predict(self, X) -> np.ndarray:
-        score = self.predict_score(X)
+    def predict(self, X, init_score=None) -> np.ndarray:
+        score = self.predict_score(X, init_score=init_score)
         if self.task == "classification":
             return (score > 0.5).astype(int)
         return score
@@ -597,6 +611,13 @@ class ExecutableCALM:
         return ModelTerms(float(fitted.intercept), fitted.link, features)
 
 
+def _check_init_score(init_score, n):
+    scores = np.asarray(init_score, dtype=float)
+    if scores.ndim != 1 or len(scores) != n or not np.isfinite(scores).all():
+        raise ValueError(f'init_score must be a finite 1D vector of length {n}')
+    return scores
+
+
 def fit_partitions(
     effect,
     partitions: dict,
@@ -610,6 +631,8 @@ def fit_partitions(
     random_state: Optional[int] = None,
     chain: Optional[CalmSequence] = None,
     calm: Optional[CALM] = None,
+    init_score: Optional[np.ndarray] = None,
+    base_logit_fn: Optional[Callable] = None,
 ) -> ExecutableCALM:
     """Materialize `{feature: Partition}` into an executable model.
 
@@ -625,6 +648,10 @@ def fit_partitions(
     if target not in ("teacher", "y"):
         raise ValueError(f"target must be 'teacher' or 'y'; got {target!r}")
     partitions = {j: p for j, p in partitions.items() if len(p.leaves) > 1}
+    if init_score is not None and task != 'classification':
+        raise ValueError('base logits are only supported for binary classification')
+    if init_score is not None and curve_fitter == 'surrogate':
+        raise ValueError('offset training needs a refitted curve_fitter, e.g. ebm')
 
     if curve_fitter == "surrogate":
         if curve_fitter_params:
@@ -662,7 +689,11 @@ def fit_partitions(
     fitter_obj = _resolve_curve_fitter(
         curve_fitter, ctx, curve_fitter_params, random_state
     )
-    fitter_obj.fit(Xt, np.asarray(y).reshape(-1), mask)
+    if init_score is None:
+        fitter_obj.fit(Xt, np.asarray(y).reshape(-1), mask)
+    else:
+        init_score = _check_init_score(init_score, len(X))
+        fitter_obj.fit(Xt, np.asarray(y).reshape(-1), mask, init_score=init_score)
     return ExecutableCALM(
         task,
         partitions=partitions,
@@ -670,6 +701,8 @@ def fit_partitions(
         calm=calm,
         transform=transform,
         curve_fitter=fitter_obj,
+        base_logit_fn=base_logit_fn,
+        requires_init_score=init_score is not None,
     )
 
 
@@ -869,7 +902,7 @@ class _CALMBase:
         return cls(**{**preset, **overrides})
 
     # -- fit --------------------------------------------------------------
-    def fit(self, X, y):
+    def fit(self, X, y, init_score=None):
         """Fit the teacher, propose and select the partitions, fit the curves.
 
         Args:
@@ -886,6 +919,18 @@ class _CALMBase:
         self.n_features_in_ = X.shape[1]
         schema = self._name_target(schema, y)
         y = self._check_y(y, X.shape[0])
+        self.base_logit_fn_ = init_score if callable(init_score) else None
+        self.init_score_ = None
+        if init_score is not None:
+            if self._task != 'classification':
+                raise ValueError('base logits are only supported for binary classification')
+            if self.selection_target != 'teacher':
+                raise ValueError('offset models require selection_target="teacher"')
+            if self.curve_fitter == 'surrogate':
+                raise ValueError('offset models require a refitted curve_fitter, e.g. ebm')
+            self.init_score_ = _check_init_score(
+                init_score(X) if callable(init_score) else init_score, len(X)
+            )
         # kept for the views: curves are drawn where the training rows are,
         # and the GAM reference of `print_summary(X, y)` is fitted on the same data
         self._X_fit, self._y_fit = X, y
@@ -897,7 +942,7 @@ class _CALMBase:
         done = False
         try:
             with progress.stage(f"teacher ({self._slot_name('teacher')})"):
-                self.teacher_ = self._resolve_teacher(X, y)
+                self.teacher_ = self._resolve_teacher(X, y, init_score=self.init_score_)
             forward = _as_forward(self.teacher_, self._task)
             with progress.stage(f"effect ({self._slot_name('effect')})"):
                 self.effect_ = self._make_effect(X, forward, schema)
@@ -946,6 +991,8 @@ class _CALMBase:
                     random_state=self.random_state,
                     chain=self.chain_,
                     calm=self.chain_.final if self.chain_ is not None else None,
+                    init_score=self.init_score_,
+                    base_logit_fn=self.base_logit_fn_,
                 )
             done = True
         finally:
@@ -955,7 +1002,7 @@ class _CALMBase:
         return self
 
     # -- predict ----------------------------------------------------------
-    def predict(self, X):
+    def predict(self, X, init_score=None):
         """Predict: values for regression, 0/1 labels for classification.
 
         Args:
@@ -964,9 +1011,9 @@ class _CALMBase:
         Returns:
             `(N,)` predictions.
         """
-        return self.model_.predict(self._encode(X))
+        return self.model_.predict(self._encode(X), init_score=init_score)
 
-    def predict_score(self, X):
+    def predict_score(self, X, init_score=None):
         """The raw score: the prediction for regression, the positive-class
         probability for classification.
 
@@ -976,7 +1023,7 @@ class _CALMBase:
         Returns:
             `(N,)` scores.
         """
-        return self.model_.predict_score(self._encode(X))
+        return self.model_.predict_score(self._encode(X), init_score=init_score)
 
     # -- views ------------------------------------------------------------
     def print_summary(self, X=None, y=None, *, max_features: int = 20):
@@ -1434,7 +1481,7 @@ class _CALMBase:
             y = y.astype(int)
         return y
 
-    def _resolve_teacher(self, X, y):
+    def _resolve_teacher(self, X, y, init_score=None):
         teacher = self.teacher
         created = False
         if isinstance(teacher, str):
@@ -1451,8 +1498,13 @@ class _CALMBase:
         elif isinstance(teacher, type):
             teacher = teacher(**(self.teacher_params or {}))
             created = True
+        if init_score is not None and not (isinstance(self.teacher, str) and self.teacher == 'xgb'):
+            raise ValueError('offset-aware interaction discovery currently requires teacher="xgb"')
         if hasattr(teacher, "fit") and (created or not self._looks_prefit(teacher)):
-            teacher.fit(X, y)
+            if init_score is not None:
+                teacher.fit(X, y, init_score=init_score)
+            else:
+                teacher.fit(X, y)
         return teacher
 
     @staticmethod
@@ -1758,7 +1810,7 @@ class CALMClassifier(_CALMBase):
 
     _task = "classification"
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, init_score=None):
         """Class probabilities, in scikit-learn's two-column shape.
 
         Args:
@@ -1767,5 +1819,5 @@ class CALMClassifier(_CALMBase):
         Returns:
             `(N, 2)` array: `[P(y=0), P(y=1)]`.
         """
-        p = np.clip(self.predict_score(X), 0.0, 1.0)
+        p = np.clip(self.predict_score(X, init_score=init_score), 0.0, 1.0)
         return np.column_stack([1.0 - p, p])

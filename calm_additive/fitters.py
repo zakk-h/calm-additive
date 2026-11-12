@@ -51,15 +51,15 @@ class _MaskedEBM:
         X_copy[mask == 0] = np.nan
         return X_copy
 
-    def fit(self, X, y, mask=None):
+    def fit(self, X, y, mask=None, init_score=None):
         X = self._prepare_X(X)
         mask = self._default_mask(X, mask)
-        self.model.fit(self._nan_masked(X, mask), y)
+        self.model.fit(self._nan_masked(X, mask), y, init_score=init_score)
 
-    def predict(self, X, mask=None):
+    def predict(self, X, mask=None, init_score=None):
         X = self._prepare_X(X)
         mask = self._default_mask(X, mask)
-        return self.model.predict(self._nan_masked(X, mask))
+        return self.model.predict(self._nan_masked(X, mask), init_score=init_score)
 
     def curves(self, link="identity"):
         """The fitted EBM as `AdditiveTerms`: per masked column its term (a
@@ -98,13 +98,13 @@ class EBMClassifier(_MaskedEBM):
     def __init__(self, **kwargs):
         self.model = ExplainableBoostingClassifier(**_ebm_kwargs(kwargs))
 
-    def predict_proba(self, X, mask=None):
+    def predict_proba(self, X, mask=None, init_score=None):
         X = self._prepare_X(X)
         mask = self._default_mask(X, mask)
-        return self.model.predict_proba(self._nan_masked(X, mask))[:, 1]
+        return self.model.predict_proba(self._nan_masked(X, mask), init_score=init_score)[:, 1]
 
-    def predict(self, X, mask=None):
-        return (self.predict_proba(X, mask) >= 0.5).astype(int)
+    def predict(self, X, mask=None, init_score=None):
+        return (self.predict_proba(X, mask, init_score=init_score) >= 0.5).astype(int)
 
 
 class ScoreAdapter(MaskedFitter):
@@ -115,14 +115,14 @@ class ScoreAdapter(MaskedFitter):
         self.impl = impl
         self.classification = classification
 
-    def fit(self, X, y, mask):
-        self.impl.fit(X, y, mask=mask)
+    def fit(self, X, y, mask, init_score=None):
+        self.impl.fit(X, y, mask=mask, init_score=init_score)
         return self
 
-    def predict(self, X, mask):
+    def predict(self, X, mask, init_score=None):
         if self.classification:
-            return np.asarray(self.impl.predict_proba(X, mask)).reshape(-1)
-        return np.asarray(self.impl.predict(X, mask)).reshape(-1)
+            return np.asarray(self.impl.predict_proba(X, mask, init_score=init_score)).reshape(-1)
+        return np.asarray(self.impl.predict(X, mask, init_score=init_score)).reshape(-1)
 
     def curves(self):
         # a classifier's terms add up on the log-odds scale
