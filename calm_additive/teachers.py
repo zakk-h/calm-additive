@@ -19,11 +19,14 @@ class XGBClassifier:
             **{**_DEFAULTS, "eval_metric": "logloss", **params}
         )
 
-    def fit(self, X, y):
-        self.model.fit(X, y)
+    def fit(self, X, y, init_score=None):
+        self.offset_fitted_ = init_score is not None
+        self.model.fit(X, y, base_margin=init_score)
         self.is_fitted_ = True
 
     def forward(self, X):
+        if getattr(self, 'offset_fitted_', False):
+            return self.model.predict(X, output_margin=True)
         return self.model.predict_proba(X)[:, 1]
 
     def predict(self, X):
@@ -34,8 +37,9 @@ class XGBRegressor:
     def __init__(self, **params):
         self.model = xgb.XGBRegressor(**{**_DEFAULTS, **params})
 
-    def fit(self, X, y):
-        self.model.fit(X, y)
+    def fit(self, X, y, init_score=None):
+        self.offset_fitted_ = init_score is not None
+        self.model.fit(X, y, base_margin=init_score)
         self.is_fitted_ = True
 
     def forward(self, X):
